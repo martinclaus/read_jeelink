@@ -1,6 +1,7 @@
-use serialport;
+use serialport::{self, SerialPort};
 use std::{
     io::{ErrorKind, Read},
+    str::FromStr,
     time::Duration,
 };
 
@@ -23,7 +24,7 @@ fn main() -> std::io::Result<()> {
                 serial_buf[..n]
                     .iter()
                     .filter_map(|&b| recorder.push(b as char))
-                    .filter_map(|f| DecodedFrame::parse(f))
+                    .filter_map(|s| s.parse::<Frame>().ok())
                     .for_each(|frame| println!("Got {:?}", frame));
             }
             Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
@@ -33,7 +34,7 @@ fn main() -> std::io::Result<()> {
 }
 
 #[derive(Debug, Clone)]
-pub struct DecodedFrame {
+pub struct Frame {
     id: u8,
     sensor_type: u8,
     new_battery: bool,
@@ -42,9 +43,9 @@ pub struct DecodedFrame {
     humidity: u8,
 }
 
-impl DecodedFrame {
-    fn parse(frame: Frame) -> Option<Self> {
-        let fields: Vec<&str> = frame.0.split(' ').collect();
+impl Frame {
+    fn parse(s: &str) -> Option<Self> {
+        let fields: Vec<&str> = s.split(' ').collect();
 
         let id: u8 = fields[0].parse().ok()?;
 
@@ -67,7 +68,7 @@ impl DecodedFrame {
             ((field & 0x80 != 0), field & 0x7F)
         };
 
-        Some(DecodedFrame {
+        Some(Frame {
             id,
             sensor_type,
             new_battery,
@@ -75,19 +76,6 @@ impl DecodedFrame {
             temperature: temp,
             humidity: hum,
         })
-    }
-}
-
-#[derive(Debug)]
-struct Frame(String);
-
-impl Frame {
-    fn new(s: &str) -> Option<Frame> {
-        if Frame::validate(s) {
-            Some(Frame(s.to_string()))
-        } else {
-            None
-        }
     }
 
     fn validate(s: &str) -> bool {
@@ -97,6 +85,19 @@ impl Frame {
         }
     }
 }
+
+impl FromStr for Frame {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if Self::validate(s) {
+            Self::parse(s).ok_or("Cannot parse message")
+        } else {
+            Err("Not a valid message")
+        }
+    }
+}
+
 enum FrameRecorderState {
     NotRecording,
     Activating(usize),
@@ -142,7 +143,7 @@ impl FrameRecorder {
         }
     }
 
-    fn push(&mut self, char: char) -> Option<Frame> {
+    fn push(&mut self, char: char) -> Option<String> {
         let n_act = self.activate_chars.len();
         let n_term = self.terminate_char.len();
         match self.state {
@@ -178,7 +179,7 @@ impl FrameRecorder {
                     FrameRecorderState::NotRecording => {
                         let frame = self.buffer.clone();
                         self.buffer.clear();
-                        Frame::new(&frame[..frame.len() - 2])
+                        Some(frame[..frame.len() - 2].to_string())
                     }
                     _ => None,
                 }
@@ -189,7 +190,7 @@ impl FrameRecorder {
 
 #[cfg(test)]
 mod test {
-    use crate::{DecodedFrame, Frame, FrameRecorder};
+    use crate::FrameRecorder;
 
     #[test]
     fn test_frame_construction() {
@@ -206,22 +207,22 @@ mod test {
 
         let mut recorder = FrameRecorder::new();
 
-        let res: Vec<Frame> = data
+        let res: Vec<String> = data
             .iter()
             .flat_map(|s| s.chars())
             .filter_map(|c| recorder.push(c))
             .collect();
 
         let expect = [
-            Frame("50 1 4 193 65".to_string()),
-            Frame("58 1 4 189 67".to_string()),
-            Frame("1 1 4 189 65".to_string()),
-            Frame("13 1 4 181 65".to_string()),
-            Frame("18 1 4 193 61".to_string()),
-            Frame("1 1 4 188 64".to_string()),
+            "50 1 4 193 65",
+            "58 1 4 189 67",
+            "1 1 4 189 65",
+            "13 1 4 181 65",
+            "18 1 4 193 61",
+            "1 1 4 188 64",
         ];
-        res.iter()
-            .zip(expect.iter())
-            .for_each(|(r, e)| assert_eq!(r.0, e.0));
+        res.into_iter()
+            .zip(expect.into_iter())
+            .for_each(|(r, e)| assert_eq!(r, e));
     }
 }
