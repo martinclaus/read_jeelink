@@ -17,7 +17,10 @@ fn main() -> std::io::Result<()> {
     println!("Ready to read");
     for frame in listener.incomming() {
         let frame = frame?;
-        println!("Got {:?}", frame);
+        println!(
+            "Sensor {:2}: Temperatur {:4}, Humidity {:2}, weak battery: {}, new battery: {}",
+            frame.id, frame.temperature, frame.humidity, frame.weak_battery, frame.new_battery
+        );
     }
     Ok(())
 }
