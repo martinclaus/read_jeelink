@@ -1,5 +1,6 @@
 use serialport::{self, SerialPort};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     io::{ErrorKind, Read},
     str::FromStr,
@@ -12,7 +13,7 @@ static TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> std::io::Result<()> {
     println!("Open port on device");
-    let mut listener = SerialListener::bind(DEVICE)?;
+    let listener = SerialListener::bind(DEVICE)?;
     println!("Ready to read");
     for frame in listener.incomming() {
         let frame = frame?;
@@ -22,29 +23,34 @@ fn main() -> std::io::Result<()> {
 }
 
 pub struct SerialListener {
-    port: Box<dyn SerialPort>,
-    recorder: FrameRecorder,
+    port: RefCell<Box<dyn SerialPort>>,
+    recorder: RefCell<FrameRecorder>,
 }
 
 impl SerialListener {
     pub fn bind(addr: &str) -> Result<SerialListener, std::io::Error> {
         let port = serialport::new(addr, BAUT_RATE).timeout(TIMEOUT).open()?;
         let recorder = FrameRecorder::new();
-        Ok(SerialListener { port, recorder })
+        Ok(SerialListener {
+            port: RefCell::new(port),
+            recorder: RefCell::new(recorder),
+        })
     }
 
     /// Blocks until at least one complete frame arrived.
-    pub fn accept(&mut self) -> std::io::Result<Vec<Frame>> {
+    pub fn accept(&self) -> std::io::Result<Vec<Frame>> {
         let mut frames: Vec<Frame> = vec![];
         let mut read_buf = [0u8; 1024];
+        let mut port = self.port.borrow_mut();
+        let mut recorder = self.recorder.borrow_mut();
         while frames.is_empty() {
-            match self.port.read(&mut read_buf) {
+            match port.read(&mut read_buf) {
                 // read n bytes
                 Ok(n) => {
                     frames.extend(
                         read_buf[..n]
                             .iter()
-                            .filter_map(|&b| self.recorder.push(b as char))
+                            .filter_map(|&b| recorder.push(b as char))
                             .filter_map(|s| s.parse::<Frame>().ok())
                             .collect::<Vec<Frame>>(),
                     );
@@ -59,7 +65,7 @@ impl SerialListener {
     }
 
     /// Return an iterator that accepts indefinately incomming frames.
-    pub fn incomming(&mut self) -> Incoming {
+    pub fn incomming(&self) -> Incoming {
         Incoming {
             listener: self,
             frame_buffer: VecDeque::new(),
@@ -68,7 +74,7 @@ impl SerialListener {
 }
 
 pub struct Incoming<'a> {
-    listener: &'a mut SerialListener,
+    listener: &'a SerialListener,
     frame_buffer: VecDeque<Frame>,
 }
 
