@@ -1,5 +1,6 @@
 use serialport::{self, SerialPort};
 use std::{
+    collections::VecDeque,
     io::{ErrorKind, Read},
     str::FromStr,
     time::Duration,
@@ -11,25 +12,80 @@ static TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> std::io::Result<()> {
     println!("Open port on device");
-    let mut port = serialport::new(DEVICE, BAUT_RATE)
-        .timeout(TIMEOUT)
-        .open_native()?;
-
+    let mut listener = SerialListener::bind(DEVICE)?;
     println!("Ready to read");
-    let mut recorder = FrameRecorder::new();
-    loop {
-        let mut serial_buf: Vec<u8> = vec![0; 64];
-        match port.read(serial_buf.as_mut_slice()) {
-            Ok(n) => {
-                serial_buf[..n]
-                    .iter()
-                    .filter_map(|&b| recorder.push(b as char))
-                    .filter_map(|s| s.parse::<Frame>().ok())
-                    .for_each(|frame| println!("Got {:?}", frame));
+    for frame in listener.incomming() {
+        let frame = frame?;
+        println!("Got {:?}", frame);
+    }
+    Ok(())
+}
+
+pub struct SerialListener {
+    port: Box<dyn SerialPort>,
+    recorder: FrameRecorder,
+}
+
+impl SerialListener {
+    pub fn bind(addr: &str) -> Result<SerialListener, std::io::Error> {
+        let port = serialport::new(addr, BAUT_RATE).timeout(TIMEOUT).open()?;
+        let recorder = FrameRecorder::new();
+        Ok(SerialListener { port, recorder })
+    }
+
+    /// Blocks until at least one complete frame arrived.
+    pub fn accept(&mut self) -> std::io::Result<Vec<Frame>> {
+        let mut frames: Vec<Frame> = vec![];
+        let mut read_buf = [0u8; 1024];
+        while frames.is_empty() {
+            match self.port.read(&mut read_buf) {
+                // read n bytes
+                Ok(n) => {
+                    frames.extend(
+                        read_buf[..n]
+                            .iter()
+                            .filter_map(|&b| self.recorder.push(b as char))
+                            .filter_map(|s| s.parse::<Frame>().ok())
+                            .collect::<Vec<Frame>>(),
+                    );
+                }
+                // no data received, keep trying
+                Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
+                // Some other error happened
+                Err(e) => eprintln!("{:?}", e),
             }
-            Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
-            Err(e) => eprintln!("{:?}", e),
         }
+        Ok(frames)
+    }
+
+    /// Return an iterator that accepts indefinately incomming frames.
+    pub fn incomming(&mut self) -> Incoming {
+        Incoming {
+            listener: self,
+            frame_buffer: VecDeque::new(),
+        }
+    }
+}
+
+pub struct Incoming<'a> {
+    listener: &'a mut SerialListener,
+    frame_buffer: VecDeque<Frame>,
+}
+
+impl<'a> Iterator for Incoming<'a> {
+    type Item = std::io::Result<Frame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.frame_buffer.is_empty() {
+            match self.listener.accept() {
+                Ok(frames) => self.frame_buffer.extend(frames),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(self
+            .frame_buffer
+            .pop_front()
+            .expect("Framebuffer empty")))
     }
 }
 
