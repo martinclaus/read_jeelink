@@ -26,17 +26,22 @@ mod serial {
         time::Duration,
     };
 
-    const BAUT_RATE: u32 = 57600;
-    static TIMEOUT: Duration = Duration::from_secs(1);
+    /// Baud rate of the device. For the JeeLink it is 57.6 KBd
+    const BAUD_RATE: u32 = 57600;
+    /// How long to listen before a time out error is issued.
+    /// This number does not have a sinificant meaning except that a low timeout may cause high CPU usage.
+    static TIMEOUT: Duration = Duration::from_millis(1000);
 
+    /// Listens on a serial device, the JeeLink v3c in this case.
     pub struct SerialListener {
         port: RefCell<Box<dyn SerialPort>>,
         recorder: RefCell<FrameRecorder>,
     }
 
     impl SerialListener {
+        /// Bind the listener to a serial device, e.g. "/dev/ttyUSB0"
         pub fn bind(addr: &str) -> Result<SerialListener, std::io::Error> {
-            let port = serialport::new(addr, BAUT_RATE).timeout(TIMEOUT).open()?;
+            let port = serialport::new(addr, BAUD_RATE).timeout(TIMEOUT).open()?;
             let recorder = FrameRecorder::new();
             Ok(SerialListener {
                 port: RefCell::new(port),
@@ -44,7 +49,7 @@ mod serial {
             })
         }
 
-        /// Blocks until at least one complete frame arrived.
+        /// Blocks reading until at least one complete frame arrived.
         pub fn accept(&self) -> std::io::Result<Vec<Frame>> {
             let mut frames: Vec<Frame> = vec![];
             let mut read_buf = [0u8; 1024];
@@ -80,6 +85,7 @@ mod serial {
         }
     }
 
+    /// Iterator over incomming data frames
     pub struct Incoming<'a> {
         listener: &'a SerialListener,
         frame_buffer: VecDeque<Frame>,
@@ -102,6 +108,7 @@ mod serial {
         }
     }
 
+    /// Data Frame received from JeeLink device
     #[derive(Debug, Clone)]
     pub struct Frame {
         pub id: u8,
@@ -113,6 +120,7 @@ mod serial {
     }
 
     impl Frame {
+        /// Convert a string to a Frame object. The string must be validated before parsing.
         fn parse(s: &str) -> Option<Self> {
             let fields: Vec<&str> = s.split(' ').collect();
 
@@ -147,6 +155,7 @@ mod serial {
             })
         }
 
+        /// Validate string to be parsable as a Frame object.
         fn validate(s: &str) -> bool {
             {
                 s.chars().all(|c| c.is_numeric() || c.is_whitespace())
@@ -158,6 +167,12 @@ mod serial {
     impl FromStr for Frame {
         type Err = &'static str;
 
+        /// Enables to use of str::parse to create a Frame object from a string
+        ///
+        /// # Example
+        /// ```rust
+        /// let parsed_frame: Frame = "50 1 4 193 65".parse().unwrap()
+        /// ```
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             if Self::validate(s) {
                 Self::parse(s).ok_or("Cannot parse message")
@@ -167,6 +182,7 @@ mod serial {
         }
     }
 
+    /// States of the FrameRecorder state machine
     enum FrameRecorderState {
         NotRecording,
         Activating(usize),
@@ -175,6 +191,7 @@ mod serial {
     }
 
     impl FrameRecorderState {
+        /// Move state forward
         fn next(&mut self, len_activation: usize, len_termination: usize) {
             match self {
                 FrameRecorderState::NotRecording => *self = FrameRecorderState::Activating(0),
@@ -195,6 +212,7 @@ mod serial {
         }
     }
 
+    /// Records frame strings from a stream of chars
     pub struct FrameRecorder {
         buffer: String,
         state: FrameRecorderState,
@@ -212,6 +230,8 @@ mod serial {
             }
         }
 
+        /// Push new char to the FrameRecorder.
+        /// Returns a completed frame sting or None, if no frame is completed.
         fn push(&mut self, char: char) -> Option<String> {
             let n_act = self.activate_chars.len();
             let n_term = self.terminate_char.len();
