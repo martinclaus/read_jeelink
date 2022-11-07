@@ -1,108 +1,128 @@
+extern crate anyhow;
 use std::time::Duration;
 
 /// Baud rate of the device. For the JeeLink it is 57.6 KBd
-const BAUD_RATE: u32 = 57600;
+pub const BAUD_RATE: u32 = 57600;
 
 /// How long to listen before a time out error is issued.
 /// This number does not have a sinificant meaning except that a low timeout may cause high CPU usage.
-static TIMEOUT: Duration = Duration::from_millis(1000);
+pub static TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Synchroneously receive data frames from the Jeelink device
-pub mod sync {
-    use super::{frame::Frame, frame::FrameRecorder, BAUD_RATE, TIMEOUT};
-    use serialport::SerialPort;
-    use std::{
-        cell::RefCell,
-        collections::VecDeque,
-        io::{ErrorKind, Read},
-    };
+// Rexport main API
+pub use frame::error::*;
+pub use frame::Frame;
+pub use listener::error::*;
+pub use listener::SerialPortListener;
 
-    /// Listens on a serial device, the JeeLink v3c in this case.
+/// Listen on data frames from the Jeelink device
+pub mod listener {
+    use crate::frame::{error::FrameCheck::Incomplete, Frame};
+    use bytes::{Buf, BytesMut};
+
+    /// Listener on serial port
     ///
-    /// A infinite iterator over received data frames can be obtained by the
-    /// associated method [[SerialListener::incomming]].
-    pub struct SerialListener {
-        port: RefCell<Box<dyn SerialPort>>,
-        recorder: RefCell<FrameRecorder>,
+    /// Allows to read frames from device stream.
+    pub struct SerialPortListener<P> {
+        port: P,
+        buffer: BytesMut,
     }
 
-    impl SerialListener {
-        /// Bind the listener to a serial device, e.g. "/dev/ttyUSB0"
-        pub fn bind(addr: &str) -> Result<SerialListener, std::io::Error> {
-            let port = serialport::new(addr, BAUD_RATE).timeout(TIMEOUT).open()?;
-            let recorder = FrameRecorder::new();
-            Ok(SerialListener {
-                port: RefCell::new(port),
-                recorder: RefCell::new(recorder),
-            })
+    impl<P> SerialPortListener<P> {
+        pub fn new(port: P) -> SerialPortListener<P> {
+            SerialPortListener {
+                port,
+                // Allocate buffer with 256 bytes
+                buffer: BytesMut::with_capacity(256),
+            }
         }
 
-        /// Blocks reading until at least one complete frame arrived.
-        pub fn accept(&self) -> std::io::Result<Vec<Frame>> {
-            let mut frames: Vec<Frame> = vec![];
-            let mut read_buf = [0u8; 1024];
-            let mut port = self.port.borrow_mut();
-            let mut recorder = self.recorder.borrow_mut();
-            while frames.is_empty() {
-                match port.read(&mut read_buf) {
-                    // read n bytes
-                    Ok(n) => {
-                        frames.extend(
-                            read_buf[..n]
-                                .iter()
-                                .filter_map(|&b| recorder.push(b as char))
-                                .filter_map(|s| s.parse::<Frame>().ok())
-                                .collect::<Vec<Frame>>(),
-                        );
+        fn parse(&mut self) -> anyhow::Result<Option<Frame>> {
+            match Frame::check(&mut self.buffer) {
+                Ok(frame_data) => {
+                    // parse frame
+                    let frame = Frame::parse(std::str::from_utf8(frame_data.chunk())?)?;
+                    Ok(Some(frame))
+                }
+                Err(Incomplete) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+    }
+
+    /// Read data frames from Jeelink asynchroneously.
+    mod asynchroneous {
+        use super::{error, SerialPortListener};
+        use crate::frame::Frame;
+        use tokio::io::AsyncReadExt;
+
+        impl SerialPortListener<tokio_serial::SerialStream> {
+            pub async fn read_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+                loop {
+                    if let Some(frame) = self.parse()? {
+                        return Ok(Some(frame));
                     }
-                    // no data received, keep trying
-                    Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
-                    // Some other error happened
-                    Err(e) => eprintln!("{:?}", e),
-                }
-            }
-            Ok(frames)
-        }
 
-        /// Return an iterator that accepts indefinately incomming frames.
-        pub fn incomming(&self) -> Incoming {
-            Incoming {
-                listener: self,
-                frame_buffer: VecDeque::new(),
+                    if 0 == self.port.read_buf(&mut self.buffer).await? {
+                        // stream closed. If buffer empty, normal close.
+                        if self.buffer.is_empty() {
+                            return Ok(None);
+                        } else {
+                            return Err(error::ListenerError::ConnectionLost)?;
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Iterator over incomming data frames
-    pub struct Incoming<'a> {
-        listener: &'a SerialListener,
-        frame_buffer: VecDeque<Frame>,
-    }
+    /// Synchroneous listener.
+    ///
+    /// This implementation arose in the learing process and is left here for testing purposes.
+    pub mod synchroneous {
+        use super::SerialPortListener;
+        use crate::frame::Frame;
+        use serialport::TTYPort;
+        use std::io::Read;
 
-    impl<'a> Iterator for Incoming<'a> {
-        type Item = std::io::Result<Frame>;
+        impl SerialPortListener<TTYPort> {
+            pub fn read_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+                let mut stack_buf = [b'0'; 256];
+                loop {
+                    if let Some(frame) = self.parse()? {
+                        return Ok(Some(frame));
+                    }
 
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.frame_buffer.is_empty() {
-                match self.listener.accept() {
-                    Ok(frames) => self.frame_buffer.extend(frames),
-                    Err(e) => return Some(Err(e)),
+                    match self.port.read(&mut stack_buf) {
+                        Ok(n) if n == 0 => (),
+                        Ok(n) => self.buffer.extend_from_slice(&stack_buf[0..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => (),
+                        Err(e) => return Err(e)?,
+                    }
                 }
             }
-            Some(Ok(self
-                .frame_buffer
-                .pop_front()
-                .expect("Framebuffer empty")))
+        }
+    }
+
+    pub mod error {
+        use thiserror::Error;
+
+        #[derive(Error, Debug, PartialEq)]
+        pub enum ListenerError {
+            #[error("Connection lost to serial device")]
+            ConnectionLost,
         }
     }
 }
 
 /// Module for creating data frames from the char stream read from the JeeLink LaCrosse firmware by FHEM.
 mod frame {
-    use std::str::FromStr;
+    use core::fmt;
+    use std::{fmt::Display, str::FromStr};
+
+    use bytes::{Buf, BytesMut};
 
     /// Data Frame received from JeeLink device
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq)]
     pub struct Frame {
         pub id: u8,
         pub sensor_type: u8,
@@ -113,32 +133,63 @@ mod frame {
     }
 
     impl Frame {
-        /// Convert a string to a Frame object. The string must be validated before parsing.
-        fn parse(s: &str) -> Option<Self> {
-            let fields: Vec<&str> = s.split(' ').collect();
+        /// Check if a full frame is available in the buffer and returns it if possible.
+        ///
+        /// The input buffer will be advanced until a start sequence of a frame is reached.
+        /// If a complete frame is in the buffer, the frames payload will be extraced and returned, and
+        /// the frame data will be remove from the buffer.
+        /// If no complete frame is found, the error FrameCheck::Incomplete is returned.
+        pub fn check(buf: &mut BytesMut) -> Result<BytesMut, error::FrameCheck> {
+            const START_SEQ: &[u8; 5] = b"OK 9 ";
+            const END_SEQ: &[u8; 2] = b"\r\n";
+            loop {
+                if buf.remaining() <= START_SEQ.len() {
+                    return Err(error::FrameCheck::Incomplete);
+                }
+                if buf.chunk().starts_with(START_SEQ) {
+                    break;
+                }
+                buf.advance(1)
+            }
 
-            let id: u8 = fields[0].parse().ok()?;
+            if let Some((i, _)) = buf.windows(2).enumerate().find(|(_, win)| win == END_SEQ) {
+                let mut frame_data = buf.split_to(i);
+                frame_data.advance(START_SEQ.len());
+                buf.advance(END_SEQ.len());
+                Ok(frame_data)
+            } else {
+                Err(error::FrameCheck::Incomplete)
+            }
+        }
+
+        /// Convert a string to a Frame object. The string must be validated before parsing.
+        pub fn parse(s: &str) -> anyhow::Result<Self> {
+            Self::validate(s)?;
+
+            let fields: Vec<&str> = s.split(|b| b == ' ').collect();
+
+            let id: u8 = fields[0].parse()?;
 
             let (new_battery, sensor_type) = {
-                let field: u8 = fields[1].parse().ok()?;
+                let field: u8 = fields[1].parse()?;
                 ((field / 128) != 0, field % 128)
             };
 
             let temp = {
-                let field1: u16 = fields[2].parse().ok()?;
-                let field2: u16 = fields[3].parse().ok()?;
+                let field1: u16 = fields[2].parse()?;
+                let field2: u16 = fields[3].parse()?;
                 let temp: u16 = (field1 << 8) + field2;
                 let temp: f32 = (temp as f32 - 1000.) / 10.;
                 temp
             };
 
             let (weak_battery, hum) = {
-                let field: u8 = fields[4].parse().ok()?;
+                let field: u8 = fields[4].parse()?;
                 // first bit is weak battery flag
                 ((field & 0x80 != 0), field & 0x7F)
             };
 
-            Some(Frame {
+            Ok(Frame {
                 id,
                 sensor_type,
                 new_battery,
@@ -149,163 +200,108 @@ mod frame {
         }
 
         /// Validate string to be parsable as a Frame object.
-        fn validate(s: &str) -> bool {
-            {
-                s.chars().all(|c| c.is_numeric() || c.is_whitespace())
-                    && s.chars().filter(|c| c.is_whitespace()).count() == 4
+        fn validate(s: &str) -> Result<(), error::FrameValidation> {
+            if !s.chars().all(|c| {
+                c.is_numeric() || c.is_whitespace() || c.is_ascii_control() || c.is_control()
+            }) {
+                return Err(error::FrameValidation::InvalidChars(s.to_string()));
             }
+            if s.chars().filter(|c| c.is_whitespace()).count() != 4 {
+                return Err(error::FrameValidation::WrongNumberOfFields(s.to_string()));
+            }
+            Ok(())
         }
     }
 
     impl FromStr for Frame {
-        type Err = &'static str;
+        type Err = anyhow::Error;
 
         /// Enables to use of str::parse to create a Frame object from a string
         ///
         /// # Example
         /// ```rust
-        /// let parsed_frame: Frame = "50 1 4 193 65".parse().unwrap()
+        /// use read_jeelink::Frame;
+        /// let parsed_frame: Frame = "50 1 4 193 65".parse().unwrap();
         /// ```
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            if Self::validate(s) {
-                Self::parse(s).ok_or("Cannot parse message")
-            } else {
-                Err("Not a valid message")
-            }
+        fn from_str(s: &str) -> anyhow::Result<Self> {
+            Self::parse(s)
         }
     }
 
-    /// States of the FrameRecorder state machine
-    enum FrameRecorderState {
-        NotRecording,
-        Activating(usize),
-        Recording,
-        Terminating(usize),
-    }
-
-    impl FrameRecorderState {
-        /// Move state forward
-        fn next(&mut self, len_activation: usize, len_termination: usize) {
-            match self {
-                FrameRecorderState::NotRecording => *self = FrameRecorderState::Activating(0),
-                FrameRecorderState::Activating(level) => {
-                    *level += 1;
-                    if *level >= (len_activation - 1) {
-                        *self = FrameRecorderState::Recording;
-                    }
-                }
-                FrameRecorderState::Recording => *self = FrameRecorderState::Terminating(0),
-                FrameRecorderState::Terminating(level) => {
-                    *level += 1;
-                    if *level >= (len_termination - 1) {
-                        *self = FrameRecorderState::NotRecording
-                    }
-                }
-            }
+    impl Display for Frame {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "Sensor {:2}: Temperatur {:4}, Humidity {:2}, weak battery: {}, new battery: {}",
+                self.id, self.temperature, self.humidity, self.weak_battery, self.new_battery
+            )
         }
     }
 
-    /// Records frame strings from a stream of chars
-    pub struct FrameRecorder {
-        buffer: String,
-        state: FrameRecorderState,
-        activate_chars: &'static [char],
-        terminate_char: &'static [char],
-    }
+    pub mod error {
+        use thiserror::Error;
 
-    impl FrameRecorder {
-        pub fn new() -> Self {
-            FrameRecorder {
-                buffer: String::new(),
-                state: FrameRecorderState::NotRecording,
-                activate_chars: &['O', 'K', ' ', '9', ' '],
-                terminate_char: &['\r', '\n'],
-            }
+        #[derive(Error, Debug, PartialEq)]
+        pub enum FrameCheck {
+            #[error("No complete frame in buffer")]
+            Incomplete,
+            #[error("Other error occured: {0}")]
+            Other(String),
         }
 
-        /// Push new char to the FrameRecorder.
-        /// Returns a completed frame sting or None, if no frame is completed.
-        pub fn push(&mut self, char: char) -> Option<String> {
-            let n_act = self.activate_chars.len();
-            let n_term = self.terminate_char.len();
-            match self.state {
-                FrameRecorderState::NotRecording => {
-                    if char == self.activate_chars[0] {
-                        self.state.next(n_act, n_term);
-                    }
-                    None
-                }
-                FrameRecorderState::Activating(level) => {
-                    if char == self.activate_chars[level + 1] {
-                        self.state.next(n_act, n_term)
-                    } else {
-                        self.state = FrameRecorderState::NotRecording;
-                    }
-                    None
-                }
-                FrameRecorderState::Recording => {
-                    self.buffer.push(char);
-                    if char == self.terminate_char[0] {
-                        self.state.next(n_act, n_term);
-                    }
-                    None
-                }
-                FrameRecorderState::Terminating(level) => {
-                    self.buffer.push(char);
-                    if char == self.terminate_char[level + 1] {
-                        self.state.next(n_act, n_term)
-                    } else {
-                        self.state = FrameRecorderState::Recording
-                    }
-                    match self.state {
-                        FrameRecorderState::NotRecording => {
-                            let frame = self.buffer.clone();
-                            self.buffer.clear();
-                            Some(frame[..frame.len() - 2].to_string())
-                        }
-                        _ => None,
-                    }
-                }
-            }
+        #[derive(Error, Debug, PartialEq)]
+        pub enum FrameValidation {
+            #[error("Frame data contains invalid characters. Allowed characters are numeric and whitespace; got: {0}")]
+            InvalidChars(String),
+            #[error("Frame requires 5 fields separated by whitespace. Got {0}")]
+            WrongNumberOfFields(String),
         }
     }
 
     #[cfg(test)]
     mod test {
-        use super::FrameRecorder;
+        use super::{error::FrameCheck, Frame};
+        use bytes::BytesMut;
 
         #[test]
-        fn test_frame_construction() {
-            let data = [
-                "OK 9 50 1 4 193 65\r\nOK 9 58 1 4 189 67\r\nOK 9 1 1 4 189 65\r\nOK 0 9 1",
-                "OK 9 ",
-                "\n[LaCrosseITPlusReader.10.1s (RFM69CW f:868300 t:30~3)",
-                "]\r\n",
-                "OK 9 13 1 4 181 ",
-                "65\r\n",
-                "OK 9 18 1 4 193 61\r\n",
-                "OK 9 1 1 4 188 64\r\n",
-            ];
+        fn test_frame_parsing() {
+            let frame: Frame = "50 1 4 193 65".parse().unwrap();
+            assert_eq!(
+                frame,
+                Frame {
+                    id: 50,
+                    sensor_type: 1,
+                    new_battery: false,
+                    weak_battery: false,
+                    temperature: 21.7,
+                    humidity: 65
+                }
+            );
+        }
 
-            let mut recorder = FrameRecorder::new();
+        #[test]
+        fn test_frame_check_detects_incomplete_frame() {
+            assert_eq!(
+                Frame::check(&mut BytesMut::from(&b"OK 9 93 954 29"[..])),
+                Err(FrameCheck::Incomplete)
+            );
+        }
 
-            let res: Vec<String> = data
-                .iter()
-                .flat_map(|s| s.chars())
-                .filter_map(|c| recorder.push(c))
-                .collect();
+        #[test]
+        fn test_frame_check_extracts_frame_data() {
+            assert_eq!(
+                Frame::check(&mut BytesMut::from(
+                    &b"45 2 5OK 9 93 954 29\r\nOK 9 25 24 63\r\n"[..]
+                )),
+                Ok(BytesMut::from(&b"93 954 29"[..]))
+            )
+        }
 
-            let expect = [
-                "50 1 4 193 65",
-                "58 1 4 189 67",
-                "1 1 4 189 65",
-                "13 1 4 181 65",
-                "18 1 4 193 61",
-                "1 1 4 188 64",
-            ];
-            res.into_iter()
-                .zip(expect.into_iter())
-                .for_each(|(r, e)| assert_eq!(r, e));
+        #[test]
+        fn test_frame_check_drops_frame_from_read_buffer() {
+            let mut buf = BytesMut::from(&b"45 2 5OK 9 93 954 29\r\nOK 9 25 24 63\r\n"[..]);
+            let _ = Frame::check(&mut buf);
+            assert_eq!(buf, &b"OK 9 25 24 63\r\n"[..]);
         }
     }
 }
